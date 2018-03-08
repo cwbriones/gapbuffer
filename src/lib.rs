@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::iter::{IntoIterator, FromIterator};
 use std::cmp::Ordering;
 use std::fmt;
-use std::ops::{Index, IndexMut};
+use std::ops::{Range, Index, IndexMut};
 
 /// A GapBuffer is a dynamic array which implements methods to shift the empty portion of the
 /// array around so that modifications can occur at any point in the array. It is optimized for
@@ -179,6 +179,23 @@ impl<T> GapBuffer<T> {
         // pop_front removes from the rightmost empty slot after the gap.
         self.buf.pop_front()
     }
+
+    /// Slices into the buffer, possibly returning more than one slice.
+    ///
+    /// Panics if the range is wider than VecDeque's length.
+    pub fn slice(&self, range: Range<usize>) -> Slice<T> {
+        let (back, front) = self.buf.as_slices();
+        if front.len() >= range.end {
+            Slice::Contiguous(&front[range])
+        } else if front.len() <= range.start {
+            let start = range.start - front.len();
+            let end = range.end - front.len();
+            Slice::Contiguous(&back[start..end])
+        } else {
+            let end = range.end - front.len();
+            Slice::Split(&front[range.start..], &back[..end])
+        }
+    }
 }
 
 //Eq & PartialEq
@@ -287,6 +304,74 @@ impl<T> IndexMut<usize> for GapBuffer<T> {
     }
 }
 
+/// A Slice into the GapBuffer.
+#[derive(Debug, Copy, Clone)]
+pub enum Slice<'a, T: 'a> {
+    Contiguous(&'a [T]),
+    Split(&'a [T], &'a [T]),
+}
+
+impl<'a, T: 'a> Slice<'a, T> {
+    pub fn len(&self) -> usize {
+        match *self {
+            Slice::Contiguous(a) => a.len(),
+            Slice::Split(a, b) => a.len() + b.len()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        if let Slice::Contiguous(a) = *self {
+            a.is_empty()
+        } else {
+            // If a side of the split were empty, this would
+            // just be represented as a Contiguous piece.
+            false
+        }
+    }
+
+    pub fn slice(&self, range: Range<usize>) -> Self {
+        match *self {
+            Slice::Contiguous(a) => Slice::Contiguous(&a[range]),
+            Slice::Split(a, _) if range.end <= a.len() => {
+                // Entirely in the first bit
+                Slice::Contiguous(&a[range])
+            },
+            Slice::Split(a, b) if range.start >= a.len() => {
+                // Entirely in the second bit
+                let start = range.start - a.len();
+                let end = range.end - a.len();
+                Slice::Contiguous(&b[start..end])
+            },
+            Slice::Split(a, b) => {
+                let end = range.end - a.len();
+                Slice::Split(&a[range.start..], &b[..end])
+            },
+        }
+    }
+}
+
+impl<'a, T: 'a> PartialEq for Slice<'a, T> where T: PartialEq {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (&Slice::Split(a, c), &Slice::Split(b, d)) => a == b && c == d,
+            (&Slice::Contiguous(a), &Slice::Contiguous(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<'a, T: 'a> PartialEq<[T]> for Slice<'a, T> where T: PartialEq {
+    fn eq(&self, other: &[T]) -> bool {
+        match self {
+            &Slice::Split(front, back) => {
+                front == &other[..front.len()] &&
+                    back == &other[front.len()..]
+            },
+            &Slice::Contiguous(slice) => slice == other,
+        }
+    }
+}
+
 //### Iterator implementation. #####################################################################
 // Could likely be made more efficient since we know we're inbounds...
 #[derive(Clone)]
@@ -316,8 +401,14 @@ impl<'a, T> Iterator for Items<'a, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
 
+    use Slice;
     use GapBuffer;
+
+    fn range(start: usize, end: usize) -> Range<usize> {
+        start..end
+    }
 
     #[test]
     fn test_init() {
@@ -401,6 +492,38 @@ mod tests {
         for (i, &x) in test2.iter().enumerate() {
             assert!(x == i + 1, "Remove test2 failed. Index {} is {}", x, i);
         }
+
+    }
+
+    #[test]
+    fn test_slice() {
+    // Test slicing.
+        let mut test: GapBuffer<usize> = GapBuffer::new();
+        for x in range(0, 10) {
+            test.insert(x,x);
+        }
+        test.shift(5);
+
+        assert_eq!(Slice::Contiguous(&[0, 1, 2, 3, 4]), test.slice(0..5));
+        assert_eq!(Slice::Contiguous(&[5, 6, 7, 8, 9]), test.slice(5..10));
+        assert_eq!(Slice::Split(&[4], &[5, 6, 7, 8]), test.slice(4..9));
+
+        assert_eq!(Slice::Split(&[3, 4], &[5, 6, 7]), test.slice(3..8));
+        test.shift(3);
+        assert_eq!(Slice::Contiguous(&[3, 4, 5, 6, 7]), test.slice(3..8));
+    }
+
+    #[test]
+    fn test_subslice() {
+        let split = Slice::Split(&[0, 1, 2], &[3, 4]);
+        assert_eq!(split.slice(0..5), split);
+        assert_eq!(split.slice(0..3), Slice::Contiguous(&[0, 1, 2]));
+        assert_eq!(split.slice(3..5), Slice::Contiguous(&[3, 4]));
+        assert_eq!(split.slice(2..5), Slice::Split(&[2], &[3, 4]));
+
+        let cont = Slice::Contiguous(&[0, 1, 2, 3, 4]);
+        assert_eq!(cont.slice(0..5), cont);
+        assert_eq!(cont.slice(2..4), Slice::Contiguous(&[2, 3]));
 
     }
 }
